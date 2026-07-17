@@ -100,6 +100,23 @@ pub fn decode_threaded_multiline<F>(width: usize, height: usize, lines: usize, d
   out
 }
 
+/// Decodes independent row groups in parallel while returning the first worker error.
+pub fn decode_threaded_multiline_result<F>(
+  width: usize,
+  height: usize,
+  lines: usize,
+  dummy: bool,
+  closure: &F,
+) -> Result<Vec<u16>, String>
+  where F : Fn(&mut [u16], usize) -> Result<(), String> + Sync {
+
+  let mut out: Vec<u16> = alloc_image_ok!(width, height, dummy);
+  out.par_chunks_mut(width*lines).enumerate().try_for_each(|(row, line)| {
+    closure(line, row*lines)
+  })?;
+  Ok(out)
+}
+
 #[derive(Debug, Clone)]
 pub struct LookupTable {
   table: Vec<(u16, u16, u16)>,

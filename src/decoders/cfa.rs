@@ -31,7 +31,7 @@ pub struct CFA {
 }
 
 impl CFA {
-  #[doc(hidden)] pub fn new_from_tag(pat: &TiffEntry) -> CFA {
+  #[doc(hidden)] pub fn new_from_tag(pat: &TiffEntry, width: usize, height: usize) -> Result<CFA, String> {
     let mut patname = String::new();
     for i in 0..pat.count() {
       patname.push(match pat.get_u32(i as usize) {
@@ -41,7 +41,7 @@ impl CFA {
         _ => 'U',
       });
     }
-    CFA::new(&patname)
+    CFA::new_with_dimensions(&patname, width, height)
   }
 
   /// Create a new CFA from a string describing it. For simplicity the pattern is specified
@@ -61,39 +61,75 @@ impl CFA {
       144 => (12,12),
       _ => panic!("Unknown CFA size \"{}\"", patname),
     };
+    CFA::new_with_dimensions(patname, width, height)
+      .unwrap_or_else(|error| panic!("{}", error))
+  }
+
+  /// Creates a CFA with explicit repeat dimensions.
+  ///
+  /// DNG stores the repeat rows and columns separately from the pattern bytes. Using those
+  /// dimensions avoids guessing from the pattern length and supports valid non-square mosaics.
+  pub fn new_with_dimensions(patname: &str, width: usize, height: usize) -> Result<CFA, String> {
+    if width == 0 || height == 0 {
+      if patname.is_empty() && width == 0 && height == 0 {
+        return Ok(CFA {
+          name: patname.to_string(),
+          pattern: [[0;48];48],
+          width: width,
+          height: height,
+        })
+      }
+      return Err(format!(
+        "CFA dimensions must both be nonzero for pattern \"{}\", got {}x{}",
+        patname, width, height
+      ))
+    }
+    if width > 48 || height > 48 {
+      return Err(format!(
+        "CFA dimensions {}x{} exceed the supported 48x48 repeat size",
+        width, height
+      ))
+    }
+    if width.checked_mul(height) != Some(patname.len()) {
+      return Err(format!(
+        "CFA pattern \"{}\" has {} colors but dimensions {}x{} require {}",
+        patname, patname.len(), width, height, width * height
+      ))
+    }
     let mut pattern: [[usize;48];48] = [[0;48];48];
 
-    if width > 0 {
-      // copy the pattern into the top left
-      for (i,c) in patname.bytes().enumerate() {
-        pattern[i/width][i%width] = match c {
-          b'R' => 0,
-          b'G' => 1,
-          b'B' => 2,
-          b'E' => 3,
-          b'M' => 1,
-          b'Y' => 3,
-          _    => {
-              let unknown_char = patname[i..].chars().next().unwrap();
-              panic!("Unknown CFA color \"{}\" in pattern \"{}\"", unknown_char, patname)
-          },
-        };
-      }
+    // copy the pattern into the top left
+    for (i,c) in patname.bytes().enumerate() {
+      pattern[i/width][i%width] = match c {
+        b'R' => 0,
+        b'G' => 1,
+        b'B' => 2,
+        b'E' => 3,
+        b'M' => 1,
+        b'Y' => 3,
+        _    => {
+          let unknown_char = patname[i..].chars().next().unwrap();
+          return Err(format!(
+            "Unknown CFA color \"{}\" in pattern \"{}\"",
+            unknown_char, patname
+          ))
+        },
+      };
+    }
 
-      // extend the pattern into the full matrix
-      for row in 0..48 {
-        for col in 0..48 {
-          pattern[row][col] = pattern[row%height][col%width];
-        }
+    // extend the pattern into the full matrix
+    for row in 0..48 {
+      for col in 0..48 {
+        pattern[row][col] = pattern[row%height][col%width];
       }
     }
 
-    CFA {
+    Ok(CFA {
       name: patname.to_string(),
       pattern: pattern,
       width: width,
       height: height,
-    }
+    })
   }
 
   /// Get the color index at the given position. Designed to be fast so it can be called
@@ -183,6 +219,26 @@ impl CFA {
 impl fmt::Debug for CFA {
   fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
     write!(f, "CFA {{ {} }}", self.name)
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::CFA;
+
+  #[test]
+  fn explicit_dimensions_support_non_square_dng_patterns() {
+    let cfa = CFA::new_with_dimensions("RGBGBGRG", 4, 2).unwrap();
+    assert_eq!((cfa.width, cfa.height), (4, 2));
+    assert_eq!(cfa.color_at(0, 0), 0);
+    assert_eq!(cfa.color_at(0, 2), 2);
+    assert_eq!(cfa.color_at(1, 0), 2);
+    assert_eq!(cfa.color_at(2, 0), 0);
+  }
+
+  #[test]
+  fn explicit_dimensions_reject_mismatched_pattern_lengths() {
+    assert!(CFA::new_with_dimensions("RGGB", 4, 2).is_err());
   }
 }
 

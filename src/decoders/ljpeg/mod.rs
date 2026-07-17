@@ -118,6 +118,10 @@ impl SOFInfo {
   }
 }
 
+fn precision_is_supported(precision: usize) -> bool {
+  precision > 0 && precision <= 16
+}
+
 #[derive(Debug)]
 pub struct LjpegDecompressor<'a> {
   buffer: &'a [u8],
@@ -149,7 +153,7 @@ impl<'a> LjpegDecompressor<'a> {
       if marker == m(Marker::SOF3) {
         // Start of the frame, giving us the basic info
         sof.parse_sof(&mut input)?;
-        if sof.precision > 16 || sof.precision < 12 {
+        if !precision_is_supported(sof.precision) {
           return Err(format!("ljpeg: sof.precision {}", sof.precision).to_string())
         }
       } else if marker == m(Marker::DHT) {
@@ -303,4 +307,18 @@ impl<'a> LjpegDecompressor<'a> {
   pub fn height(&self) -> usize { self.sof.height }
   pub fn super_v(&self) -> usize { self.sof.components[0].super_v }
   pub fn super_h(&self) -> usize { self.sof.components[0].super_h }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::precision_is_supported;
+
+  #[test]
+  fn lossless_jpeg_accepts_eight_bit_precision() {
+    assert!(precision_is_supported(8));
+    assert!(precision_is_supported(12));
+    assert!(precision_is_supported(16));
+    assert!(!precision_is_supported(0));
+    assert!(!precision_is_supported(17));
+  }
 }

@@ -178,7 +178,7 @@ impl<'a> BitPump for BitPumpJPEG<'a> {
   #[inline(always)]
   fn peek_bits(&mut self, num: u32) -> u32 {
     if num > self.nbits && !self.finished {
-      if self.pos < self.buffer.len()-4 &&
+      if self.pos.saturating_add(4) <= self.buffer.len() &&
          self.buffer[self.pos+0] != 0xff &&
          self.buffer[self.pos+1] != 0xff &&
          self.buffer[self.pos+2] != 0xff &&
@@ -199,7 +199,8 @@ impl<'a> BitPump for BitPumpJPEG<'a> {
               let nextbyte = self.buffer[self.pos];
               if nextbyte != 0xff {
                 nextbyte
-              } else if self.buffer[self.pos+1] == 0x00 {
+              } else if self.pos.saturating_add(1) < self.buffer.len()
+                     && self.buffer[self.pos+1] == 0x00 {
                 self.pos += 1; // Skip the extra byte used to mark 255
                 nextbyte
               } else {
@@ -217,8 +218,9 @@ impl<'a> BitPump for BitPumpJPEG<'a> {
     }
     if num > self.nbits && self.finished {
       // Stuff with zeroes to not fail to read
-      self.bits <<= 32;
-      self.nbits += 32;
+      let missing = num - self.nbits;
+      self.bits <<= missing;
+      self.nbits += missing;
     }
 
     (self.bits >> (self.nbits-num)) as u32
@@ -226,8 +228,20 @@ impl<'a> BitPump for BitPumpJPEG<'a> {
 
   #[inline(always)]
   fn consume_bits(&mut self, num: u32) {
+    // A JPEG marker can end the entropy stream with fewer buffered bits than a fast Huffman cache
+    // entry consumes. The decoder's established behavior is to pad that tail with zeroes; do the
+    // same here instead of allowing unsigned subtraction to panic.
+    if num > self.nbits {
+      let missing = num - self.nbits;
+      self.bits <<= missing;
+      self.nbits += missing;
+    }
     self.nbits -= num;
-    self.bits &= (1 << self.nbits) - 1;
+    self.bits &= if self.nbits == 64 {
+      u64::MAX
+    } else {
+      (1_u64 << self.nbits) - 1
+    };
   }
 }
 
@@ -296,5 +310,25 @@ impl<'a> ByteStream<'a> {
     }
     self.pos += 1; // Make the next byte the marker
     Ok(skip_count+1)
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{BitPump, BitPumpJPEG};
+
+  #[test]
+  fn jpeg_pump_zero_pads_a_marker_terminated_tail_without_panicking() {
+    let mut pump = BitPumpJPEG::new(&[0b1010_0000, 0xff, 0xd9]);
+    assert_eq!(pump.get_bits(4), 0b1010);
+    assert_eq!(pump.get_bits(16), 0);
+    pump.consume_bits(24);
+    assert_eq!(pump.get_bits(1), 0);
+  }
+
+  #[test]
+  fn jpeg_pump_handles_a_terminal_ff_byte_without_reading_past_the_buffer() {
+    let mut pump = BitPumpJPEG::new(&[0xff]);
+    assert_eq!(pump.get_bits(16), 0);
   }
 }

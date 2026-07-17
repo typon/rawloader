@@ -45,6 +45,7 @@ impl<'a> Decoder for DngDecoder<'a> {
       7 => self.decode_compressed(raw, width*cpp, height, cpp, dummy)?,
       c => return Err(format!("Don't know how to read DNGs with compression {}", c).to_string()),
     };
+    let cfa = if linear {CFA::new("")} else {self.get_cfa(raw)?};
 
     let (make, model, clean_make, clean_model, orientation) = {
       match self.rawloader.check_supported(&self.tiff) {
@@ -75,7 +76,7 @@ impl<'a> Decoder for DngDecoder<'a> {
       blacklevels: self.get_blacklevels(raw)?,
       whitelevels: self.get_whitelevels(raw)?,
       xyz_to_cam: self.get_color_matrix()?,
-      cfa: if linear {CFA::new("")} else {self.get_cfa(raw)?},
+      cfa: cfa,
       crops: self.get_crops(raw, width, height)?,
       blackareas: self.get_masked_areas(raw),
       orientation: orientation,
@@ -93,17 +94,43 @@ impl<'a> DngDecoder<'a> {
   }
 
   fn get_blacklevels(&self, raw: &TiffIFD) -> Result<[u16;4], String> {
-    if let Some(levels) = raw.find_entry(Tag::BlackLevels) {
+    let mut blacklevels = if let Some(levels) = raw.find_entry(Tag::BlackLevels) {
       if levels.count() < 4 {
         let black = levels.get_f32(0) as u16;
-        Ok([black, black, black, black])
+        [black, black, black, black]
       } else {
-        Ok([levels.get_f32(0) as u16,levels.get_f32(1) as u16,
-            levels.get_f32(2) as u16,levels.get_f32(3) as u16])
+        [levels.get_f32(0) as u16,levels.get_f32(1) as u16,
+         levels.get_f32(2) as u16,levels.get_f32(3) as u16]
       }
     } else {
-      Ok([0,0,0,0])
+      [0,0,0,0]
+    };
+
+    // DNG permits per-column and per-row offsets in addition to the repeating base black level.
+    // RawImage exposes one calibration value per color channel, so preserve the mean offset rather
+    // than silently dropping the delta tags (which can otherwise leave previews strongly tinted).
+    let mean_delta = self.mean_tag(raw, Tag::BlackLevelDeltaH)
+      + self.mean_tag(raw, Tag::BlackLevelDeltaV);
+    if mean_delta != 0.0 {
+      for black in &mut blacklevels {
+        *black = ((f32::from(*black) + mean_delta).round().max(0.0).min(65535.0)) as u16;
+      }
     }
+    Ok(blacklevels)
+  }
+
+  fn mean_tag(&self, raw: &TiffIFD, tag: Tag) -> f32 {
+    let Some(entry) = raw.find_entry(tag) else {
+      return 0.0
+    };
+    if entry.count() == 0 {
+      return 0.0
+    }
+    let mut total = 0.0;
+    for index in 0..entry.count() {
+      total += entry.get_f32(index);
+    }
+    total / entry.count() as f32
   }
 
   fn get_whitelevels(&self, raw: &TiffIFD) -> Result<[u16;4], String> {
@@ -113,7 +140,16 @@ impl<'a> DngDecoder<'a> {
 
   fn get_cfa(&self, raw: &TiffIFD) -> Result<CFA,String> {
     let pattern = fetch_tag!(raw, Tag::CFAPattern);
-    Ok(CFA::new_from_tag(pattern))
+    let dimensions = fetch_tag!(raw, Tag::CFARepeatPatternDim);
+    if dimensions.count() != 2 {
+      return Err(format!(
+        "DNG: CFA repeat dimensions have {} values, expected 2",
+        dimensions.count()
+      ))
+    }
+    let height = dimensions.get_usize(0);
+    let width = dimensions.get_usize(1);
+    CFA::new_from_tag(pattern, width, height)
   }
 
   fn get_crops(&self, raw: &TiffIFD, width: usize, height: usize) -> Result<[usize;4],String> {
@@ -200,7 +236,17 @@ impl<'a> DngDecoder<'a> {
         return Err("DNG: files with more than one slice not supported yet".to_string())
       }
       let offset = offsets.get_usize(0);
-      let src = &self.buffer[offset..];
+      if offset >= self.buffer.len() {
+        return Err(format!("DNG: strip offset {} is outside the file", offset))
+      }
+      let end = if let Some(byte_counts) = raw.find_entry(Tag::StripByteCounts) {
+        offset.checked_add(byte_counts.get_usize(0))
+          .ok_or_else(|| "DNG: strip byte count overflowed".to_string())?
+          .min(self.buffer.len())
+      } else {
+        self.buffer.len()
+      };
+      let src = &self.buffer[offset..end];
       let mut out = alloc_image_ok!(width, height, dummy);
       let decompressor = LjpegDecompressor::new(src)?;
       decompressor.decode(&mut out, 0, width, width, height, dummy)?;
@@ -215,19 +261,41 @@ impl<'a> DngDecoder<'a> {
         return Err(format!("DNG: trying to decode {} tiles from {} offsets",
                            coltiles*rowtiles, offsets.count()).to_string())
       }
+      let byte_counts = raw.find_entry(Tag::TileByteCounts);
+      if let Some(counts) = byte_counts {
+        if counts.count() != offsets.count() {
+          return Err(format!(
+            "DNG: found {} tile offsets but {} tile byte counts",
+            offsets.count(), counts.count()
+          ))
+        }
+      }
 
-      Ok(decode_threaded_multiline(width, height, tlength, dummy, &(|strip: &mut [u16], row| {
+      decode_threaded_multiline_result(width, height, tlength, dummy, &(|strip: &mut [u16], row| {
         let row = row / tlength;
         for col in 0..coltiles {
-          let offset = offsets.get_usize(row*coltiles+col);
-          let src = &self.buffer[offset..];
-          let decompressor = LjpegDecompressor::new(src).unwrap();
+          let tile = row*coltiles+col;
+          let offset = offsets.get_usize(tile);
+          if offset >= self.buffer.len() {
+            return Err(format!("DNG: tile {} offset {} is outside the file", tile, offset))
+          }
+          let end = if let Some(counts) = byte_counts {
+            offset.checked_add(counts.get_usize(tile))
+              .ok_or_else(|| format!("DNG: tile {} byte count overflowed", tile))?
+              .min(self.buffer.len())
+          } else {
+            self.buffer.len()
+          };
+          let src = &self.buffer[offset..end];
+          let decompressor = LjpegDecompressor::new(src)
+            .map_err(|error| format!("DNG: tile {} header: {}", tile, error))?;
           let bwidth = cmp::min(width, (col+1)*twidth) - col*twidth;
           let blength = cmp::min(height, (row+1)*tlength) - row*tlength;
-          // FIXME: instead of unwrap() we need to propagate the error
-          decompressor.decode(strip, col*twidth, width, bwidth, blength, dummy).unwrap();
+          decompressor.decode(strip, col*twidth, width, bwidth, blength, dummy)
+            .map_err(|error| format!("DNG: tile {} pixels: {}", tile, error))?;
         }
-      })))
+        Ok(())
+      }))
     } else {
       Err("DNG: didn't find tiles or strips".to_string())
     }
