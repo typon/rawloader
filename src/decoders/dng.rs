@@ -182,15 +182,120 @@ impl<'a> DngDecoder<'a> {
   }
 
   fn get_crops(&self, raw: &TiffIFD, width: usize, height: usize) -> Result<[usize;4],String> {
-    if let Some(crops) = raw.find_entry(Tag::ActiveArea) {
-      Ok([crops.get_usize(0), width - crops.get_usize(3),
-          height - crops.get_usize(2), crops.get_usize(1)])
+    let active_area = if let Some(active) = raw.find_entry(Tag::ActiveArea) {
+      if active.count() < 4 {
+        return Err(format!(
+          "DNG: ActiveArea has {} values, expected 4",
+          active.count()
+        ))
+      }
+      [
+        active.get_usize(0),
+        active.get_usize(1),
+        active.get_usize(2),
+        active.get_usize(3),
+      ]
     } else {
       // Ignore missing crops, at least some pentax DNGs don't have it
-      Ok([0,0,0,0])
-    }
+      [0, 0, height, width]
+    };
+
+    let default_crop = match (
+      raw.find_entry(Tag::DefaultCropOrigin),
+      raw.find_entry(Tag::DefaultCropSize),
+    ) {
+      (Some(origin), Some(size)) => {
+        if origin.count() < 2 || size.count() < 2 {
+          return Err(format!(
+            "DNG: DefaultCropOrigin/DefaultCropSize have {}/{} values, expected 2/2",
+            origin.count(), size.count()
+          ))
+        }
+        Some((
+          [origin.get_f32(0), origin.get_f32(1)],
+          [size.get_f32(0), size.get_f32(1)],
+        ))
+      },
+      _ => None,
+    };
+
+    crop_margins_from_dng(width, height, active_area, default_crop)
+  }
+}
+
+/// Resolves DNG's final crop, whose origin is relative to the top-left of ActiveArea.
+fn crop_margins_from_dng(
+  width: usize,
+  height: usize,
+  active_area: [usize; 4],
+  default_crop: Option<([f32; 2], [f32; 2])>,
+) -> Result<[usize; 4], String> {
+  let [active_top, active_left, active_bottom, active_right] = active_area;
+  if active_top >= active_bottom || active_left >= active_right ||
+     active_bottom > height || active_right > width {
+    return Err(format!(
+      "DNG: ActiveArea {:?} is invalid for dimensions {}x{}",
+      active_area, width, height
+    ))
   }
 
+  let (crop_left, crop_top, crop_width, crop_height) = match default_crop {
+    Some((origin, size)) => {
+      let values = [origin[0], origin[1], size[0], size[1]];
+      if values.iter().any(|value| !value.is_finite() || *value < 0.0) ||
+         size[0] <= 0.0 || size[1] <= 0.0 {
+        return Err(format!(
+          "DNG: DefaultCropOrigin {:?} or DefaultCropSize {:?} is invalid",
+          origin, size
+        ))
+      }
+      let origin_x = origin[0].round() as usize;
+      let origin_y = origin[1].round() as usize;
+      let crop_width = size[0].round() as usize;
+      let crop_height = size[1].round() as usize;
+      if crop_width == 0 || crop_height == 0 {
+        return Err(format!(
+          "DNG: rounded DefaultCropSize {:?} is empty",
+          size
+        ))
+      }
+      (
+        active_left.checked_add(origin_x)
+          .ok_or_else(|| "DNG: final crop X origin overflowed".to_string())?,
+        active_top.checked_add(origin_y)
+          .ok_or_else(|| "DNG: final crop Y origin overflowed".to_string())?,
+        crop_width,
+        crop_height,
+      )
+    },
+    None => (
+      active_left,
+      active_top,
+      active_right - active_left,
+      active_bottom - active_top,
+    ),
+  };
+  let crop_right = crop_left.checked_add(crop_width)
+    .ok_or_else(|| "DNG: final crop width overflowed".to_string())?;
+  let crop_bottom = crop_top.checked_add(crop_height)
+    .ok_or_else(|| "DNG: final crop height overflowed".to_string())?;
+  if crop_left < active_left || crop_top < active_top ||
+     crop_right > active_right || crop_bottom > active_bottom {
+    return Err(format!(
+      "DNG: final crop [{}, {}, {}, {}] lies outside ActiveArea {:?}",
+      crop_top, crop_left, crop_bottom, crop_right, active_area
+    ))
+  }
+
+  Ok([
+    crop_top,
+    width - crop_right,
+    height - crop_bottom,
+    crop_left,
+  ])
+}
+
+impl<'a> DngDecoder<'a> {
   fn get_masked_areas(&self, raw: &TiffIFD) -> Vec<(u64, u64, u64, u64)> {
     let mut areas = Vec::new();
 
@@ -349,7 +454,36 @@ fn linearize_samples(samples: &mut [u16], table: &[u16]) {
 
 #[cfg(test)]
 mod tests {
-  use super::linearize_samples;
+  use super::{crop_margins_from_dng, linearize_samples};
+
+  #[test]
+  fn default_crop_is_resolved_relative_to_active_area() {
+    let margins = crop_margins_from_dng(
+      3152,
+      2068,
+      [12, 64, 2068, 3152],
+      Some(([8.0, 4.0], [3072.0, 2048.0])),
+    ).unwrap();
+    assert_eq!(margins, [16, 8, 4, 72]);
+  }
+
+  #[test]
+  fn active_area_remains_the_crop_when_default_crop_is_absent() {
+    let margins =
+      crop_margins_from_dng(4312, 2876, [18, 22, 2874, 4312], None).unwrap();
+    assert_eq!(margins, [18, 0, 2, 22]);
+  }
+
+  #[test]
+  fn default_crop_cannot_escape_the_active_sensor_area() {
+    let error = crop_margins_from_dng(
+      100,
+      80,
+      [4, 6, 76, 96],
+      Some(([2.0, 3.0], [90.0, 70.0])),
+    ).unwrap_err();
+    assert!(error.contains("lies outside ActiveArea"));
+  }
 
   #[test]
   fn linearization_maps_each_stored_code_exactly_once() {

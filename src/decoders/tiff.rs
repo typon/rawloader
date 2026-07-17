@@ -80,6 +80,8 @@ pub enum Tag {
   BlackLevelDeltaH = 0xC61B,
   BlackLevelDeltaV = 0xC61C,
   WhiteLevel       = 0xC61D,
+  DefaultCropOrigin = 0xC61F,
+  DefaultCropSize   = 0xC620,
   ColorMatrix1     = 0xC621,
   ColorMatrix2     = 0xC622,
   AsShotNeutral    = 0xC628,
