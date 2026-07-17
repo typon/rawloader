@@ -40,11 +40,12 @@ impl<'a> Decoder for DngDecoder<'a> {
     let cpp = fetch_tag!(raw, Tag::SamplesPerPixel).get_usize(0);
     let linear = fetch_tag!(raw, Tag::PhotometricInt).get_usize(0) == 34892;
 
-    let image = match fetch_tag!(raw, Tag::Compression).get_u32(0) {
+    let mut image = match fetch_tag!(raw, Tag::Compression).get_u32(0) {
       1 => self.decode_uncompressed(raw, width*cpp, height, dummy)?,
       7 => self.decode_compressed(raw, width*cpp, height, cpp, dummy)?,
       c => return Err(format!("Don't know how to read DNGs with compression {}", c).to_string()),
     };
+    self.apply_linearization(&mut image, dummy)?;
     let cfa = if linear {CFA::new("")} else {self.get_cfa(raw)?};
 
     let (make, model, clean_make, clean_model, orientation) = {
@@ -138,6 +139,33 @@ impl<'a> DngDecoder<'a> {
     Ok([level,level,level,level])
   }
 
+  /// Maps stored sample codes through the DNG linearization table after any compression has been
+  /// decoded. The table applies to every storage format and bit depth, not only 8-bit strips.
+  fn apply_linearization(&self, image: &mut [u16], dummy: bool) -> Result<(), String> {
+    if dummy {
+      return Ok(())
+    }
+    let linearization = match self.tiff.find_entry(Tag::Linearization) {
+      Some(entry) => entry,
+      None => return Ok(()),
+    };
+    if linearization.count() == 0 {
+      return Err("DNG: linearization table is empty".to_string())
+    }
+    let mut table = Vec::with_capacity(linearization.count());
+    for index in 0..linearization.count() {
+      let value = linearization.get_u32(index);
+      if value > u16::max_value() as u32 {
+        return Err(format!(
+          "DNG: linearization value {} at index {} exceeds 16-bit output",
+          value, index
+        ))
+      }
+      table.push(value as u16);
+    }
+    linearize_samples(image, &table)
+  }
+
   fn get_cfa(&self, raw: &TiffIFD) -> Result<CFA,String> {
     let pattern = fetch_tag!(raw, Tag::CFAPattern);
     let dimensions = fetch_tag!(raw, Tag::CFARepeatPatternDim);
@@ -208,24 +236,16 @@ impl<'a> DngDecoder<'a> {
 
   pub fn decode_uncompressed(&self, raw: &TiffIFD, width: usize, height: usize, dummy: bool) -> Result<Vec<u16>,String> {
     let offset = fetch_tag!(raw, Tag::StripOffsets).get_usize(0);
+    if offset >= self.buffer.len() {
+      return Err(format!("DNG: strip offset {} is outside the file", offset))
+    }
     let src = &self.buffer[offset..];
 
     match fetch_tag!(raw, Tag::BitsPerSample).get_u32(0) {
       16  => Ok(decode_16le(src, width, height, dummy)),
       12  => Ok(decode_12be(src, width, height, dummy)),
       10  => Ok(decode_10le(src, width, height, dummy)),
-      8   => {
-        // It's 8 bit so there will be linearization involved surely!
-        let linearization = fetch_tag!(self.tiff, Tag::Linearization);
-        let curve = {
-          let mut points = vec![0 as u16; 256];
-          for i in 0..256 {
-            points[i] = linearization.get_u32(i) as u16;
-          }
-          LookupTable::new(&points)
-        };
-        Ok(decode_8bit_wtable(src, &curve, width, height, dummy))
-      },
+      8   => decode_8bit_codes(src, width, height, dummy),
       bps => Err(format!("DNG: Don't know about {} bps images", bps).to_string()),
     }
   }
@@ -299,5 +319,56 @@ impl<'a> DngDecoder<'a> {
     } else {
       Err("DNG: didn't find tiles or strips".to_string())
     }
+  }
+}
+
+/// Expands raw 8-bit storage codes without assuming that a linearization table exists.
+fn decode_8bit_codes(src: &[u8], width: usize, height: usize, dummy: bool) -> Result<Vec<u16>, String> {
+  if dummy {
+    return Ok(vec![0])
+  }
+  let sample_count = width.checked_mul(height)
+    .ok_or_else(|| "DNG: 8-bit sample count overflowed".to_string())?;
+  if src.len() < sample_count {
+    return Err(format!(
+      "DNG: 8-bit strip contains {} bytes, expected at least {}",
+      src.len(), sample_count
+    ))
+  }
+  Ok(src[..sample_count].iter().map(|sample| *sample as u16).collect())
+}
+
+/// Applies one exact DNG linearization lookup while rejecting malformed out-of-range codes.
+fn linearize_samples(samples: &mut [u16], table: &[u16]) -> Result<(), String> {
+  for (pixel, sample) in samples.iter_mut().enumerate() {
+    let code = *sample as usize;
+    if code >= table.len() {
+      return Err(format!(
+        "DNG: sample code {} at pixel {} exceeds linearization table length {}",
+        code, pixel, table.len()
+      ))
+    }
+    *sample = table[code];
+  }
+  Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::linearize_samples;
+
+  #[test]
+  fn linearization_maps_each_stored_code_exactly_once() {
+    let mut samples = [0_u16, 1, 3, 2, 1];
+    linearize_samples(&mut samples, &[0, 8, 32, 255]).unwrap();
+    assert_eq!(samples, [0, 8, 255, 32, 8]);
+  }
+
+  #[test]
+  fn linearization_rejects_codes_outside_the_table() {
+    let mut samples = [0_u16, 3];
+    let error = linearize_samples(&mut samples, &[0, 8, 32]).unwrap_err();
+    assert!(error.contains("sample code 3"));
+    assert!(error.contains("table length 3"));
   }
 }
