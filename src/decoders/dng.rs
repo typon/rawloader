@@ -163,7 +163,8 @@ impl<'a> DngDecoder<'a> {
       }
       table.push(value as u16);
     }
-    linearize_samples(image, &table)
+    linearize_samples(image, &table);
+    Ok(())
   }
 
   fn get_cfa(&self, raw: &TiffIFD) -> Result<CFA,String> {
@@ -338,19 +339,12 @@ fn decode_8bit_codes(src: &[u8], width: usize, height: usize, dummy: bool) -> Re
   Ok(src[..sample_count].iter().map(|sample| *sample as u16).collect())
 }
 
-/// Applies one exact DNG linearization lookup while rejecting malformed out-of-range codes.
-fn linearize_samples(samples: &mut [u16], table: &[u16]) -> Result<(), String> {
-  for (pixel, sample) in samples.iter_mut().enumerate() {
-    let code = *sample as usize;
-    if code >= table.len() {
-      return Err(format!(
-        "DNG: sample code {} at pixel {} exceeds linearization table length {}",
-        code, pixel, table.len()
-      ))
-    }
-    *sample = table[code];
+/// Applies the DNG linearization lookup, mapping codes above its range to the final table entry.
+fn linearize_samples(samples: &mut [u16], table: &[u16]) {
+  let last_index = table.len() - 1;
+  for sample in samples.iter_mut() {
+    *sample = table[(*sample as usize).min(last_index)];
   }
-  Ok(())
 }
 
 #[cfg(test)]
@@ -360,15 +354,14 @@ mod tests {
   #[test]
   fn linearization_maps_each_stored_code_exactly_once() {
     let mut samples = [0_u16, 1, 3, 2, 1];
-    linearize_samples(&mut samples, &[0, 8, 32, 255]).unwrap();
+    linearize_samples(&mut samples, &[0, 8, 32, 255]);
     assert_eq!(samples, [0, 8, 255, 32, 8]);
   }
 
   #[test]
-  fn linearization_rejects_codes_outside_the_table() {
-    let mut samples = [0_u16, 3];
-    let error = linearize_samples(&mut samples, &[0, 8, 32]).unwrap_err();
-    assert!(error.contains("sample code 3"));
-    assert!(error.contains("table length 3"));
+  fn linearization_maps_codes_above_the_table_to_its_last_entry() {
+    let mut samples = [0_u16, 3, u16::max_value()];
+    linearize_samples(&mut samples, &[0, 8, 32]);
+    assert_eq!(samples, [0, 32, 32]);
   }
 }
