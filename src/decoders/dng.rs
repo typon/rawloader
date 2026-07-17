@@ -178,7 +178,21 @@ impl<'a> DngDecoder<'a> {
     }
     let height = dimensions.get_usize(0);
     let width = dimensions.get_usize(1);
-    CFA::new_from_tag(pattern, width, height)
+    let cfa = CFA::new_from_tag(pattern, width, height)?;
+    let Some(active) = raw.find_entry(Tag::ActiveArea) else {
+      return Ok(cfa)
+    };
+    if active.count() < 4 {
+      return Err(format!(
+        "DNG: ActiveArea has {} values, expected 4",
+        active.count()
+      ))
+    }
+    Ok(align_cfa_to_sensor_origin(
+      cfa,
+      active.get_usize(0),
+      active.get_usize(1),
+    ))
   }
 
   fn get_crops(&self, raw: &TiffIFD, width: usize, height: usize) -> Result<[usize;4],String> {
@@ -221,6 +235,16 @@ impl<'a> DngDecoder<'a> {
 
     crop_margins_from_dng(width, height, active_area, default_crop)
   }
+}
+
+/// DNG defines CFAPattern at ActiveArea's top-left, while RawImage pixels retain the full IFD.
+fn align_cfa_to_sensor_origin(cfa: CFA, active_top: usize, active_left: usize) -> CFA {
+  if cfa.width == 0 || cfa.height == 0 {
+    return cfa
+  }
+  let shift_x = (cfa.width - active_left % cfa.width) % cfa.width;
+  let shift_y = (cfa.height - active_top % cfa.height) % cfa.height;
+  cfa.shift(shift_x, shift_y)
 }
 
 /// Resolves DNG's final crop, whose origin is relative to the top-left of ActiveArea.
@@ -454,7 +478,20 @@ fn linearize_samples(samples: &mut [u16], table: &[u16]) {
 
 #[cfg(test)]
 mod tests {
-  use super::{crop_margins_from_dng, linearize_samples};
+  use super::{align_cfa_to_sensor_origin, crop_margins_from_dng, linearize_samples};
+  use crate::decoders::cfa::CFA;
+
+  #[test]
+  fn cfa_pattern_is_shifted_from_active_area_to_full_sensor_coordinates() {
+    let cfa = align_cfa_to_sensor_origin(CFA::new("RGGB"), 13, 12);
+    assert_eq!(cfa.name, "GBRG");
+  }
+
+  #[test]
+  fn cfa_pattern_keeps_its_phase_for_repeat_aligned_active_area() {
+    let cfa = align_cfa_to_sensor_origin(CFA::new("RGGB"), 12, 64);
+    assert_eq!(cfa.name, "RGGB");
+  }
 
   #[test]
   fn default_crop_is_resolved_relative_to_active_area() {
