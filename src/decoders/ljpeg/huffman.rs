@@ -151,7 +151,15 @@ impl HuffTable {
   pub fn huff_decode(&self, pump: &mut dyn BitPump) -> Result<i32,String> {
     let code = pump.peek_bits(DECODE_CACHE_BITS) as usize;
     if let Some((bits,decode)) = self.decodecache[code] {
-      pump.consume_bits(bits as u32);
+      if decode == -32768 && !self.dng_bug {
+        // JPEG's category-16 special case implies -32768 and stores no payload bits.
+        // Cache generation includes the nominal 16-bit length in `bits`, so remove it
+        // here or the fast path desynchronizes the remainder of the lossless stream.
+        debug_assert!(bits > 16);
+        pump.consume_bits(bits as u32 - 16);
+      } else {
+        pump.consume_bits(bits as u32);
+      }
       Ok(decode as i32)
     } else {
       let decode = self.huff_decode_slow(pump);
@@ -215,5 +223,40 @@ impl fmt::Debug for HuffTable {
     } else {
       write!(f, "HuffTable {{ uninitialized }}")
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{HuffTable, MockPump};
+
+  fn category_16_table(dng_bug: bool) -> HuffTable {
+    let mut bits = [0; 17];
+    bits[1] = 1;
+    let mut values = [0; 256];
+    values[0] = 16;
+    HuffTable::new(bits, values, dng_bug).unwrap()
+  }
+
+  #[test]
+  fn compliant_category_16_consumes_only_its_huffman_code() {
+    let table = category_16_table(false);
+    let mut pump = MockPump::empty();
+    pump.set(0, 32);
+    let before = pump.validbits();
+
+    assert_eq!(table.huff_decode(&mut pump).unwrap(), -32768);
+    assert_eq!(before - pump.validbits(), 1);
+  }
+
+  #[test]
+  fn legacy_dng_category_16_also_consumes_its_payload() {
+    let table = category_16_table(true);
+    let mut pump = MockPump::empty();
+    pump.set(0, 32);
+    let before = pump.validbits();
+
+    assert_eq!(table.huff_decode(&mut pump).unwrap(), -32768);
+    assert_eq!(before - pump.validbits(), 17);
   }
 }
