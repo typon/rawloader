@@ -74,6 +74,7 @@ pub enum Tag {
   SrwRGGBBlacks    = 0xA028,
   Cr2Id            = 0xc5d8,
   DNGVersion       = 0xC612,
+  UniqueCameraModel = 0xC614,
   Linearization    = 0xC618,
   BlackLevelRepeatDim = 0xC619,
   BlackLevels      = 0xC61A,

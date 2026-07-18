@@ -1,3 +1,7 @@
+use oxideav_core::{
+  CodecId as OxideCodecId, CodecParameters as OxideCodecParameters, Frame as OxideFrame,
+  Packet as OxidePacket, TimeBase as OxideTimeBase,
+};
 use std::f32::NAN;
 use std::cmp;
 
@@ -56,10 +60,15 @@ impl<'a> Decoder for DngDecoder<'a> {
            cam.orientation)
         },
         Err(_) => {
-          let make = fetch_tag!(self.tiff, Tag::Make).get_str();
-          let model = fetch_tag!(self.tiff, Tag::Model).get_str();
+          let make = self.tiff.find_entry(Tag::Make)
+            .map(|entry| entry.get_str().to_string())
+            .unwrap_or_else(|| "DNG".to_string());
+          let model = self.tiff.find_entry(Tag::Model)
+            .or_else(|| self.tiff.find_entry(Tag::UniqueCameraModel))
+            .map(|entry| entry.get_str().to_string())
+            .unwrap_or_else(|| "DNG".to_string());
           let orientation = Orientation::from_tiff(&self.tiff);
-          (make.to_string(), model.to_string(), make.to_string(), model.to_string(), orientation)
+          (make.clone(), model.clone(), make, model, orientation)
         },
       }
     };
@@ -398,8 +407,22 @@ impl<'a> DngDecoder<'a> {
       };
       let src = &self.buffer[offset..end];
       let mut out = alloc_image_ok!(width, height, dummy);
-      let decompressor = LjpegDecompressor::new(src)?;
-      decompressor.decode(&mut out, 0, width, width, height, dummy)?;
+      match LjpegDecompressor::new(src) {
+        Ok(decompressor) => decompressor.decode(&mut out, 0, width, width, height, dummy)?,
+        Err(lossless_error) => decode_dct_jpeg(
+          src,
+          &mut out,
+          0,
+          width,
+          width,
+          height,
+          fetch_tag!(raw, Tag::WhiteLevel).get_u32(0),
+          dummy,
+        ).map_err(|dct_error| format!(
+          "DNG: JPEG header was neither lossless ({}) nor DCT ({})",
+          lossless_error, dct_error
+        ))?,
+      }
       Ok(out)
     } else if let Some(offsets) = raw.find_entry(Tag::TileOffsets) {
       // They've gone with tiling
@@ -437,12 +460,28 @@ impl<'a> DngDecoder<'a> {
             self.buffer.len()
           };
           let src = &self.buffer[offset..end];
-          let decompressor = LjpegDecompressor::new(src)
-            .map_err(|error| format!("DNG: tile {} header: {}", tile, error))?;
           let bwidth = cmp::min(width, (col+1)*twidth) - col*twidth;
           let blength = cmp::min(height, (row+1)*tlength) - row*tlength;
-          decompressor.decode(strip, col*twidth, width, bwidth, blength, dummy)
-            .map_err(|error| format!("DNG: tile {} pixels: {}", tile, error))?;
+          match LjpegDecompressor::new(src) {
+            Ok(decompressor) => decompressor
+              .decode(strip, col*twidth, width, bwidth, blength, dummy)
+              .map_err(|error| format!(
+                "DNG: tile {} lossless JPEG pixels: {}", tile, error
+              ))?,
+            Err(lossless_error) => decode_dct_jpeg(
+              src,
+              strip,
+              col*twidth,
+              width,
+              bwidth,
+              blength,
+              fetch_tag!(raw, Tag::WhiteLevel).get_u32(0),
+              dummy,
+            ).map_err(|dct_error| format!(
+              "DNG: tile {} header was neither lossless ({}) nor DCT ({})",
+              tile, lossless_error, dct_error
+            ))?,
+          }
         }
         Ok(())
       }))
@@ -450,6 +489,146 @@ impl<'a> DngDecoder<'a> {
       Err("DNG: didn't find tiles or strips".to_string())
     }
   }
+}
+
+/// Decodes an extended-sequential DCT JPEG tile, including the 12-bit grayscale form used by
+/// lossy DNG. The decoded JPEG can stack multiple destination rows across one encoded row; this
+/// is the same legal DNG layout handled by the lossless-JPEG path.
+fn decode_dct_jpeg(
+  src: &[u8],
+  out: &mut [u16],
+  x: usize,
+  stripwidth: usize,
+  width: usize,
+  height: usize,
+  target_white: u32,
+  dummy: bool,
+) -> Result<(), String> {
+  if dummy || width == 0 || height == 0 {
+    return Ok(())
+  }
+  let info = oxideav_mjpeg::inspect_jpeg(src)
+    .map_err(|error| format!("JPEG inspection failed: {}", error))?;
+  if !info.sof_kind.is_dct() {
+    return Err(format!("JPEG frame {:?} is not DCT-compressed", info.sof_kind))
+  }
+  if info.num_components() != 1 {
+    return Err(format!(
+      "DNG DCT JPEG has {} components, expected one sensor plane",
+      info.num_components()
+    ))
+  }
+  let encoded_width = info.width as usize;
+  let encoded_height = info.height as usize;
+  if encoded_width == 0 || encoded_height == 0 {
+    return Err(format!(
+      "DNG DCT JPEG has invalid dimensions {}x{}",
+      encoded_width, encoded_height
+    ))
+  }
+
+  let horizontal = encoded_width >= width && encoded_height >= height;
+  let stacked_factor = if !horizontal && encoded_width % width == 0 {
+    let factor = encoded_width / width;
+    if factor > 1
+      && encoded_height.checked_mul(factor)
+        .map_or(false, |decoded_height| decoded_height >= height)
+    {
+      Some(factor)
+    } else {
+      None
+    }
+  } else {
+    None
+  };
+  if !horizontal && stacked_factor.is_none() {
+    return Err(format!(
+      "DNG DCT JPEG {}x{} cannot fill tile {}x{}",
+      encoded_width, encoded_height, width, height
+    ))
+  }
+  let row_end = x.checked_add(width)
+    .ok_or_else(|| "DNG DCT JPEG destination row overflowed".to_string())?;
+  if row_end > stripwidth {
+    return Err(format!(
+      "DNG DCT JPEG destination {}..{} exceeds row width {}",
+      x, row_end, stripwidth
+    ))
+  }
+  let required = (height - 1).checked_mul(stripwidth)
+    .and_then(|offset| offset.checked_add(row_end))
+    .ok_or_else(|| "DNG DCT JPEG destination size overflowed".to_string())?;
+  if required > out.len() {
+    return Err(format!(
+      "DNG DCT JPEG destination has {} samples, needs {}",
+      out.len(), required
+    ))
+  }
+
+  let mut params = OxideCodecParameters::video(OxideCodecId::new("mjpeg"));
+  params.width = Some(info.width as u32);
+  params.height = Some(info.height as u32);
+  let mut decoder = oxideav_mjpeg::decoder::make_decoder(&params)
+    .map_err(|error| format!("could not create DCT JPEG decoder: {}", error))?;
+  let packet = OxidePacket::new(0, OxideTimeBase::new(1, 1), src.to_vec());
+  decoder.send_packet(&packet)
+    .map_err(|error| format!("could not submit DCT JPEG tile: {}", error))?;
+  let frame = decoder.receive_frame()
+    .map_err(|error| format!("DCT JPEG decode failed: {}", error))?;
+  let video = match frame {
+    OxideFrame::Video(video) => video,
+    _ => return Err("DCT JPEG decoder returned a non-video frame".to_string()),
+  };
+  if video.planes.len() != 1 {
+    return Err(format!(
+      "DNG DCT JPEG decoded to {} planes, expected one",
+      video.planes.len()
+    ))
+  }
+  let plane = &video.planes[0];
+  let bytes_per_sample = if info.precision <= 8 { 1 } else { 2 };
+  let row_bytes = encoded_width.checked_mul(bytes_per_sample)
+    .ok_or_else(|| "DNG DCT JPEG row size overflowed".to_string())?;
+  if plane.stride < row_bytes || plane.data.len() < plane.stride.saturating_mul(encoded_height) {
+    return Err(format!(
+      "DNG DCT JPEG plane has stride {} and {} bytes for {}x{} samples",
+      plane.stride, plane.data.len(), encoded_width, encoded_height
+    ))
+  }
+  let encoded_white = if info.precision >= 16 {
+    u16::max_value() as u32
+  } else {
+    (1_u32 << info.precision) - 1
+  };
+  let target_white = target_white.min(u16::max_value() as u32).max(1);
+  let read_sample = |row: usize, column: usize| -> u16 {
+    let offset = row * plane.stride + column * bytes_per_sample;
+    let encoded = if bytes_per_sample == 1 {
+      plane.data[offset] as u16
+    } else {
+      u16::from_le_bytes([plane.data[offset], plane.data[offset + 1]])
+    };
+    (((encoded as u32) * target_white + encoded_white / 2) / encoded_white)
+      .min(u16::max_value() as u32) as u16
+  };
+
+  for encoded_row in 0..encoded_height {
+    for encoded_column in 0..encoded_width {
+      let (output_row, output_column) = if let Some(factor) = stacked_factor {
+        (
+          encoded_row * factor + encoded_column / width,
+          encoded_column % width,
+        )
+      } else {
+        (encoded_row, encoded_column)
+      };
+      if output_row < height && output_column < width {
+        out[output_row * stripwidth + x + output_column] =
+          read_sample(encoded_row, encoded_column);
+      }
+    }
+  }
+  Ok(())
 }
 
 /// Expands raw 8-bit storage codes without assuming that a linearization table exists.

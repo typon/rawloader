@@ -78,6 +78,7 @@ mod kdc;
 mod dcs;
 mod rw2;
 mod raf;
+mod raspberrypi;
 mod dcr;
 mod dng;
 mod pef;
@@ -433,6 +434,12 @@ impl RawLoader {
       return Ok(dec as Box<dyn Decoder>);
     }
 
+    // Legacy Raspberry Pi camera tools append a BRCM Bayer payload to an otherwise ordinary
+    // JPEG. Detect that payload before treating the JPEG header as an unsupported container.
+    if let Some(decoder) = raspberrypi::RaspberryPiDecoder::new(&buffer[..buf.size])? {
+      return Ok(Box::new(decoder));
+    }
+
     if let Ok(tiff) = TiffIFD::new_file(buffer) {
       if tiff.has_entry(Tag::DNGVersion) {
         return Ok(Box::new(dng::DngDecoder::new(buffer, tiff, self)))
@@ -450,6 +457,8 @@ impl RawLoader {
 
         return match fetch_tag!(tiff, Tag::Make).get_str().to_string().as_ref() {
           "SONY"                        => use_decoder!(arw::ArwDecoder, buffer, tiff, self),
+          // Hasselblad Lunar files retain Sony's ARW container and private metadata.
+          "HASSELBLAD"                  => use_decoder!(arw::ArwDecoder, buffer, tiff, self),
           "Mamiya-OP Co.,Ltd."          => use_decoder!(mef::MefDecoder, buffer, tiff, self),
           "OLYMPUS IMAGING CORP."       => use_decoder!(orf::OrfDecoder, buffer, tiff, self),
           "OLYMPUS CORPORATION"         => use_decoder!(orf::OrfDecoder, buffer, tiff, self),

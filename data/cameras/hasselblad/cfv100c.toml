@@ -1,0 +1,10 @@
+make = "Hasselblad"
+model = "CFV 100C/Electronic Shutter"
+clean_make = "Hasselblad"
+clean_model = "CFV 100C"
+blackpoint = 4267
+whitepoint = 65535
+color_matrix = [6468, -1899, -545, -4526, 12267, 2542, -388, 1276, 6096]
+color_pattern = "RGGB"
+crops = [106,118,0,136]
+hints = ["uncompressed"]
